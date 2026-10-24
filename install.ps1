@@ -149,10 +149,31 @@ function Save-Download([string]$Url, [string]$OutFile, [string]$Sha256) {
     }
 }
 
-function Wait-ForDepot([string]$DepotDir) {
+# Steam writes download_depot's result to its console log; returns 'done', 'failed: <line>' or $null.
+function Get-DepotLogResult([string]$Log, [int64]$From) {
+    if (-not (Test-Path $Log)) { return $null }
+    $fs = [IO.File]::Open($Log, 'Open', 'Read', 'ReadWrite')
+    try {
+        if ($fs.Length -lt $From) { $From = 0 }
+        [void]$fs.Seek($From, 'Begin')
+        $text = (New-Object IO.StreamReader($fs)).ReadToEnd()
+    } finally {
+        $fs.Dispose()
+    }
+    foreach ($line in ($text -split "`n")) {
+        if ($line -match "(?i)depot download complete.*depot_$DepotId") { return 'done' }
+        if ($line -match '(?i)depot download failed') { return "failed: $($line.Trim())" }
+    }
+    return $null
+}
+
+function Wait-ForDepot([string]$DepotDir, [string]$SteamPath) {
     $command = "download_depot $AppId $DepotId $Manifest"
     $exe = Join-Path $DepotDir 'GeometryDash.exe'
     if (Test-Path $exe) { return }
+    $log = Join-Path $SteamPath 'logs\console_log.txt'
+    $logStart = [int64]0
+    if (Test-Path $log) { $logStart = (Get-Item $log).Length }
 
     try { Set-Clipboard -Value $command } catch { }
     Write-Note 'Steam has to download 2.2081 with your own account. Opening the Steam console now.'
@@ -167,6 +188,13 @@ function Wait-ForDepot([string]$DepotDir) {
     $stableSince = $null
     while ($true) {
         Start-Sleep -Seconds 3
+        $result = Get-DepotLogResult $log $logStart
+        if ($result -eq 'done') {
+            Write-Host ''
+            Write-Ok 'Steam reports the download is complete.'
+            return
+        }
+        if ($result) { Stop-WithError "Steam could not download 2.2081 ($result)." }
         if (-not (Test-Path $exe)) { continue }
         $bytes = Get-FolderBytes $DepotDir
         if ($bytes -ne $last) {
@@ -175,7 +203,8 @@ function Wait-ForDepot([string]$DepotDir) {
             Write-Host ("`r   downloaded {0:N0} MB   " -f ($bytes / 1MB)) -NoNewline
             continue
         }
-        if ($bytes -gt 250MB -and ((Get-Date) - $stableSince).TotalSeconds -ge 15) {
+        # Fallback in case Steam's log wording changes: nothing written for a minute.
+        if ($bytes -gt 250MB -and ((Get-Date) - $stableSince).TotalSeconds -ge 60) {
             Write-Host ''
             return
         }
@@ -212,11 +241,12 @@ function Invoke-Rollback {
 
     if (Get-Process -Name GeometryDash -ErrorAction SilentlyContinue) {
         if ($DryRun) {
-            Write-Note 'Geometry Dash is running; a real run would ask you to close it.'
+            Write-Note 'Geometry Dash is running; a real run would wait for you to close it.'
         } else {
-            Write-Host "`n   Close Geometry Dash, then press Enter." -ForegroundColor Yellow
-            [void](Read-Host)
-            if (Get-Process -Name GeometryDash -ErrorAction SilentlyContinue) { Stop-WithError 'Geometry Dash is still running.' }
+            Write-Host "`n   Waiting for you to close Geometry Dash (it saves your progress as it closes)." -ForegroundColor Yellow
+            while (Get-Process -Name GeometryDash -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
+            Start-Sleep -Seconds 3
+            Write-Ok 'Geometry Dash is closed.'
         }
     }
 
@@ -248,7 +278,7 @@ function Invoke-Rollback {
             }
             Write-Would "copy $depotDir over $($gd.Dir)"
         } else {
-            Wait-ForDepot $depotDir
+            Wait-ForDepot $depotDir $steam
             $depotStamp = Get-PeTimestamp $depotExe
             if ($depotStamp -ne $TargetStamp) {
                 Stop-WithError "Steam's download is $(Get-BuildName $depotStamp), not $TargetVersion. Delete $depotDir and run this again."
